@@ -38,12 +38,28 @@ class SpeckleFlowDataset(Dataset):
     def _load_all_files(self, roots):
         file_idx_counter = 0
         for group_name, root_dir in roots.items():
-            if not os.path.exists(root_dir): continue
+            if not os.path.exists(root_dir):
+                print(f"Warning: Directory not found: {root_dir}")
+                continue
 
-            if 'gaoyuzhi' in group_name or 'gaoyuzhi' in root_dir:
+            # 🔥🔥🔥 核心修改：明确指定每一组的 m 值 (mm) 🔥🔥🔥
+            # m = 像素物理尺寸(mm) * 散斑像素大小(pixels)
+
+            if 'gaoyuzhi' in group_name:
+                # 第一组老数据
                 current_m = 0.012915
-            else:
+                print(f"   -> Group '{group_name}': Matched 'gaoyuzhi', set m = {current_m:.6f} mm")
+
+            elif 'group_680W' in group_name or '680W' in root_dir:
+                # 第二组老数据
                 current_m = 0.011167
+                print(f"   -> Group '{group_name}': Matched '680W', set m = {current_m:.6f} mm")
+
+            elif 'group_580W' in group_name:
+                # 🔥 这里填你新数据的名字和算出来的 m 值
+                # 例如：像素 0.00345mm * 散斑 3.2px = 0.01104
+                current_m = 0.011808  # <--- 请修改这里！
+                print(f"   -> Group '{group_name}': Matched 'new_experiment', set m = {current_m:.6f} mm")
 
             files = glob.glob(os.path.join(root_dir, "*.csv"))
             for fpath in files:

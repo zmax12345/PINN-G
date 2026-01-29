@@ -12,10 +12,18 @@ from model import SpecklePINN
 
 # ================= 配置 =================
 CONFIG = {
-    'roots': {
+    # 1. 训练集路径 (原本的那两组)
+    'train_roots': {
         'group_680W': '/data/zm/2026.1.12_testdata/1.15_150_680W/',
         'group_gaoyuzhi': '/data/zm/2026.1.12_testdata/gaoyuzhi/'
     },
+
+    # 2. 验证集路径 (你的新数据放在这里!)
+    # 请修改为你新数据的真实路径
+    'val_roots': {
+        'group_580W': '/data/zm/2026.1.12_testdata/1.15_150_580W/'
+    },
+
     'window_size_us': 100000,
     'step_size_us': 50000,
     'batch_size': 64,
@@ -23,37 +31,52 @@ CONFIG = {
     'epochs': 50,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     'lambda_flow': 1.0,
-    'lambda_fit': 10.0,
-    'save_dir': '/data/zm/2026.1.12_testdata/1.26_PINN_result',
-
-    # 🔥🔥🔥 严酷验证：保留流速列表 🔥🔥🔥
-    # 训练集将看不到这些流速，必须靠物理规律“猜”出来
-    'holdout_flows': [0.8, 1.8, 2.5]
+    'lambda_fit': 10.0,  # 如果用了加权，这个可以适当降低，比如 1.0
+    'save_dir': '/data/zm/2026.1.12_testdata/1.26_PINN_result/1.29',  # 换个文件夹存权重，别覆盖了之前的
 }
 
 
 def main():
     os.makedirs(CONFIG['save_dir'], exist_ok=True)
 
-    # 1. 准备数据 (物理隔离)
-    print("Loading TRAIN dataset...")
-    # train 模式：排除 holdout_flows
-    train_ds = SpeckleFlowDataset(CONFIG['roots'], mode='train',
-                                  holdout_flows=CONFIG['holdout_flows'],
-                                  window_size_us=CONFIG['window_size_us'],
-                                  step_size_us=CONFIG['step_size_us'])
+    # --- 1. 加载训练集 (全量) ---
+    print("Loading TRAIN dataset (All Old Data)...")
+    # holdout_flows 设为空 []，表示不保留，全部用于训练
+    train_ds = SpeckleFlowDataset(
+        data_roots=CONFIG['train_roots'],
+        mode='train',
+        holdout_flows=[],  # <--- 关键修改：空列表 = 全量训练
+        window_size_us=CONFIG['window_size_us'],
+        step_size_us=CONFIG['step_size_us']
+    )
 
-    print("Loading VAL dataset...")
-    # val 模式：只包含 holdout_flows
-    val_ds = SpeckleFlowDataset(CONFIG['roots'], mode='val',
-                                holdout_flows=CONFIG['holdout_flows'],
-                                window_size_us=CONFIG['window_size_us'],
-                                step_size_us=CONFIG['step_size_us'])
+    # --- 2. 加载验证集 (新数据) ---
+    print("Loading VAL dataset (New Unseen Data)...")
+    # 这里的 mode 无所谓了，因为 holdout_flows 为空，
+    # 但为了逻辑通顺，我们还是设为 'val'，且 holdout 设为空（表示该文件夹下所有文件都是验证集）
+    # 注意：dataset.py 的逻辑是：
+    # if mode='val' and not is_holdout: continue
+    # 所以为了让它读取所有新文件，我们需要一个小技巧：
+    # 把 holdout_flows 设为 None 或者一个特殊标记？
+    # 不，最简单的办法是直接改一下 dataset.py 让它更灵活，
+    # 或者直接用 mode='train' (因为 train 模式下如果不匹配 holdout 就会读取)，
+    # 但这听起来很怪。
+
+    # 💡 最优解：稍微改一下 dataset.py 的逻辑，或者简单粗暴地：
+    # 在下面调用时，把 mode='train' 传给验证集 (意思是"读取所有非排除文件")
+    # 因为我们的 val_roots 里全是新数据，我们希望全读进来，且没有任何排除项。
+    val_ds = SpeckleFlowDataset(
+        data_roots=CONFIG['val_roots'],
+        mode='train',  # 这里用 'train' 是为了骗过 dataset.py 让它读取所有文件
+        holdout_flows=[],  # 不排除任何文件
+        window_size_us=CONFIG['window_size_us'],
+        step_size_us=CONFIG['step_size_us']
+    )
 
     train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=4)
     val_loader = DataLoader(val_ds, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=4)
 
-    print(f"Data split: Train={len(train_ds)} slices, Val={len(val_ds)} slices")
+    print(f"Data split: Train={len(train_ds)} slices, Val (New)={len(val_ds)} slices")
 
     # 2. 模型
     model = SpecklePINN().to(CONFIG['device'])
