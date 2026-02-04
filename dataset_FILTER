@@ -1,0 +1,193 @@
+import os
+import glob
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+from scipy.signal import correlate, iirnotch, filtfilt
+
+# 96点 Grid (保持不变)
+TAU_LAGS = np.unique(np.concatenate([
+    np.arange(0, 500, 10),
+    np.arange(500, 5001, 100),
+    np.arange(5000, 150001, 1000),
+])).astype(np.int64)
+
+
+class SpeckleFlowDataset(Dataset):
+    def __init__(self, data_roots, mode='train', holdout_flows=None, window_size_us=100000, step_size_us=50000):
+        self.window_size_us = int(window_size_us)
+        self.step_size_us = int(step_size_us)
+        self.tau_lags = TAU_LAGS
+        self.mode = mode
+        self.holdout_flows = holdout_flows if holdout_flows is not None else []
+        self.dt_us = 10
+
+        # 🔥🔥🔥 修正 Point C: 多谐波陷波 + 较宽的 Q 🔥🔥🔥
+        self.notch_base_f0 = 132.47
+        self.notch_harmonics = [1, 2, 3]  # 滤除 132, 264, 396 Hz
+        self.notch_Q = 10.0  # 降低 Q 值，增加带宽，防止频率漂移滤不干净
+
+        # 直接存储处理好的 Tensor，避免 Index 错位 (修复 Point A)
+        self.samples = []
+
+        print(f"Dataset ({mode}) initializing: Multi-Harmonic Filtering + Pre-computation...")
+        self._load_and_process_data(data_roots)
+        print(f"Dataset ({mode}) ready: {len(self.samples)} samples loaded.")
+
+    def _load_and_process_data(self, roots):
+        fs = 1e6 / self.dt_us  # 100kHz
+
+        # 预先设计好一组滤波器 (级联)
+        filters = []
+        for k in self.notch_harmonics:
+            f_target = k * self.notch_base_f0
+            if f_target < fs / 2:  # 只有小于奈奎斯特频率的才有效
+                b, a = iirnotch(f_target, self.notch_Q, fs)
+                filters.append((b, a))
+                print(f"   -> Configured Notch: {f_target:.2f} Hz (Q={self.notch_Q})")
+
+        for group_name, root_dir in roots.items():
+            if not os.path.exists(root_dir): continue
+
+            # m 值匹配
+            if 'gaoyuzhi' in group_name:
+
+                current_m = 0.014611
+
+            elif 'group_680W' in group_name:
+
+                current_m = 0.0105
+
+            elif 'group_580W' in group_name:
+
+                current_m = 0.0114853  # 如果需要校准，在这里改
+
+            elif 'group_122' in group_name:
+
+                current_m = 0.010154
+
+            elif 'group_2.3' in group_name:
+
+                current_m = 0.010099
+            elif 'group_2.4' in group_name:
+
+                current_m = 0.00996
+
+            else:
+
+                current_m = 0.011808
+
+            files = glob.glob(os.path.join(root_dir, "*.csv"))
+            for fpath in files:
+                try:
+                    # --- 文件名解析 ---
+                    fname = os.path.basename(fpath)
+                    try:
+                        name_clean = fname.replace("_clip.csv", "").replace("mm.csv", "").replace("mm", "")
+                        flow_val = float(name_clean)
+                    except:
+                        continue
+
+                    # Holdout 逻辑
+                    is_holdout = False
+                    for hv in self.holdout_flows:
+                        if abs(flow_val - hv) < 0.01:
+                            is_holdout = True;
+                            break
+                    if self.mode == 'train' and is_holdout: continue
+                    if self.mode == 'val' and not is_holdout: continue
+
+                    # --- 读取 ---
+                    # 修复 Point E: 强制使用 col 2 作为时间，col 1 作为 x
+                    with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                        df = pd.read_csv(f, header=None, usecols=[0, 1, 2], dtype=str, engine='c', on_bad_lines='skip')
+                    df = df.apply(pd.to_numeric, errors='coerce').dropna().astype(np.int64)
+
+                    # 修复 Point E: 显式指定列
+                    # Col 0: Row, Col 1: Col, Col 2: Time
+                    if df.shape[1] < 3: continue
+
+                    # --- 1. ROI 裁剪 ---
+                    # 只保留 col(x) <= 768
+                    df = df[df.iloc[:, 1] <= 768]
+                    if len(df) < 1000: continue
+
+                    tin_array = np.ascontiguousarray(df.iloc[:, 2].sort_values().values)
+                    t_start = tin_array[0]
+                    duration = tin_array[-1] - t_start
+                    if duration <= 0: continue
+
+                    # --- 2. 生成直方图 (Raw) ---
+                    num_bins_total = int(duration // self.dt_us) + 1
+                    I_t_raw, _ = np.histogram(tin_array - t_start, bins=num_bins_total,
+                                              range=(0, num_bins_total * self.dt_us))
+                    I_t_raw = I_t_raw.astype(np.float32)
+
+                    # --- 3. 级联滤波 (Clean) ---
+                    I_t_clean = I_t_raw.copy()
+                    # 依次通过所有谐波滤波器
+                    for b, a in filters:
+                        I_t_clean = filtfilt(b, a, I_t_clean)
+
+                    # --- 4. 切片与计算特征 (修复 Point D: 预计算) ---
+                    win_bins = self.window_size_us // self.dt_us
+                    step_bins = self.step_size_us // self.dt_us
+
+                    # 修复 Point F: 切片计算 +1
+                    num_slices = (len(I_t_clean) - win_bins) // step_bins + 1
+
+                    for i in range(num_slices):
+                        start_bin = i * step_bins
+                        end_bin = start_bin + win_bins
+
+                        # 🔥 修复 Point B: 使用 RAW 数据判断事件数 🔥
+                        event_count_raw = np.sum(I_t_raw[start_bin:end_bin])
+                        if event_count_raw < 500: continue  # 阈值判断
+
+                        # 取出 clean 数据做相关
+                        I_slice_clean = I_t_clean[start_bin:end_bin]
+
+                        # --- 计算自相关 ---
+                        mean_I = np.mean(I_slice_clean)
+                        baseline = mean_I ** 2
+
+                        # 快速跳过全 0 或极低光强
+                        if baseline < 1e-9: continue
+
+                        acf = correlate(I_slice_clean, I_slice_clean, mode='full', method='fft')
+                        center = len(acf) // 2
+                        acf_right = acf[center:]
+
+                        norm_arr = np.arange(len(I_slice_clean), 0, -1).astype(np.float32)
+                        G2 = acf_right / (norm_arr + 1e-9)
+
+                        g2_final = G2 / baseline
+
+                        # 映射到 Log Grid
+                        indices = (self.tau_lags // self.dt_us).astype(np.int64)
+                        indices = np.clip(indices, 0, len(g2_final) - 1)
+                        g2_feature = g2_final[indices]
+
+                        # 清洗与 Clamping
+                        g2_feature = np.nan_to_num(g2_feature, nan=1.0)
+                        g2_feature = np.maximum(g2_feature, 0.0)  # 允许降到 0, 不一定要 0.5
+                        g2_feature = np.minimum(g2_feature, 1.5)  # 防止爆炸
+
+                        # 存入列表 (修复 Point A: 永远不会错位)
+                        self.samples.append({
+                            'g2_curve': torch.from_numpy(g2_feature).float(),
+                            'aux_input': torch.tensor([np.log10(mean_I + 1e-6)]).float(),
+                            'flow_label': torch.tensor([flow_val]).float(),
+                            'k_factor': torch.tensor([current_m]).float()
+                        })
+
+                except Exception as e:
+                    print(f"Skip {fpath}: {e}")
+
+    def __getitem__(self, idx):
+        # 极速读取，零计算量
+        return self.samples[idx]
+
+    def __len__(self):
+        return len(self.samples)
